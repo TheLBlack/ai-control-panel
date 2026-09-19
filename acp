@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -f "$DIR/.env" ]] && set -a && . "$DIR/.env" && set +a
+
+HOST="${1:-${HOST:-}}"
+PORT="${2:-${PORT:-}}"
+KEY="${3:-${KEY:-}}"
+GITHUB_USERS="${GITHUB_USERS:-}"
+LOCAL_PORT="${LOCAL_PORT:-2222}"
+STATE="$HOME/.acp"
+
+[[ -n "$HOST" && -n "$PORT" ]] || { echo "usage: acp <user@host> <port> [key]" >&2; exit 1; }
+KEYOPT=(); [[ -n "$KEY" ]] && KEYOPT=(-i "$KEY" -o IdentitiesOnly=yes)
+
+mkdir -p "$STATE" "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+[[ -f "$STATE/host_key" ]] || ssh-keygen -q -t ed25519 -N "" -f "$STATE/host_key"
+
+cat > "$STATE/sshd_config" <<CFG
+ListenAddress 127.0.0.1
+Port $LOCAL_PORT
+HostKey $STATE/host_key
+PidFile $STATE/sshd.pid
+AuthorizedKeysFile $STATE/authorized_keys
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+StrictModes no
+CFG
+
+cat > "$STATE/tmux.conf" <<CFG
+unbind C-b
+set -g prefix C-a
+bind C-a send-prefix
+set -g default-terminal "tmux-256color"
+set -ga terminal-overrides ",*:Tc"
+set -g mouse on
+set -g history-limit 50000
+set -g window-size latest
+set -g escape-time 0
+set -g status off
+set -s set-clipboard on
+set -ga terminal-features ",*:clipboard"
+CFG
+
+: > "$STATE/authorized_keys"
+for u in $GITHUB_USERS; do
+  curl -fsSL "https://github.com/$u.keys" >> "$STATE/authorized_keys" || echo "keys for $u failed" >&2
+done
+chmod 600 "$STATE/authorized_keys"
+
+[[ -f "$STATE/sshd.pid" ]] && kill "$(cat "$STATE/sshd.pid")" 2>/dev/null || true
+/usr/sbin/sshd -f "$STATE/sshd_config" -q -D &
+SSHD=$!
+trap 'kill $SSHD 2>/dev/null; rm -f "$STATE/sshd.pid"' EXIT
+
+while :; do
+  ssh -N ${KEYOPT[@]+"${KEYOPT[@]}"} -o ServerAliveInterval=15 -o ExitOnForwardFailure=yes -R "$PORT:localhost:$LOCAL_PORT" "$HOST" || true
+  sleep 3
+done
